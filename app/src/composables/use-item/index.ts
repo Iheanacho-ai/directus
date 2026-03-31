@@ -250,6 +250,73 @@ export function useItem<T extends Item>(
 		const relationsStore = useRelationsStore();
 		const relations = relationsStore.getRelationsForCollection(collection.value);
 
+		const visited = new Set<string>();
+
+		function scrubNestedRelationalIds(currentCollection: string, currentItem: Item, depth = 0) {
+			if (depth > 10) return;
+
+			const visitedKey = `${currentCollection}:${depth}`;
+			if (visited.has(visitedKey)) return;
+			visited.add(visitedKey);
+
+			const currentRelations = relationsStore.getRelationsForCollection(currentCollection);
+
+			for (const relation of currentRelations) {
+				const oneField = relation.meta?.one_field;
+				if (!oneField || !(oneField in currentItem)) continue;
+
+				const relatedPrimaryKeyField = fieldsStore.getPrimaryKeyFieldForCollection(relation.collection);
+				if (!relatedPrimaryKeyField) continue;
+
+				const existsJunctionRelated = relationsStore.relations.find(
+					(r) => r.collection === relation.collection && r.meta?.many_field === relation.meta?.junction_field,
+				);
+
+				const scrubRelatedObject = (obj: Item) => {
+					clearPrimaryKey(relatedPrimaryKeyField, obj);
+					clearJunctionRelatedKey(relation, existsJunctionRelated, obj);
+
+					scrubNestedRelationalIds(relation.collection, obj, depth + 1);
+
+					const junctionField = relation.meta?.junction_field;
+					if (!junctionField || !isObject(obj[junctionField]) || !existsJunctionRelated) return;
+
+					let junctionRelatedCollection: string | null = null;
+
+					if (existsJunctionRelated.related_collection) {
+						junctionRelatedCollection = existsJunctionRelated.related_collection;
+					} else if (
+						existsJunctionRelated.meta?.one_collection_field &&
+						obj[existsJunctionRelated.meta.one_collection_field]
+					) {
+						junctionRelatedCollection = obj[existsJunctionRelated.meta.one_collection_field] as string;
+					}
+
+					if (!junctionRelatedCollection) return;
+
+					scrubNestedRelationalIds(junctionRelatedCollection, obj[junctionField] as Item, depth + 1);
+				};
+
+				if (Array.isArray(currentItem[oneField])) {
+					currentItem[oneField] = currentItem[oneField].map((relatedItem: Item | PrimaryKey) => {
+						if (!isObject(relatedItem)) return relatedItem;
+						scrubRelatedObject(relatedItem);
+						return relatedItem;
+					});
+				} else if (isObject(currentItem[oneField])) {
+					const alterations = currentItem[oneField] as Alterations;
+
+					for (const item of alterations.create) {
+						if (isObject(item)) scrubRelatedObject(item as Item);
+					}
+
+					for (const item of alterations.update) {
+						if (isObject(item)) scrubRelatedObject(item as Item);
+					}
+				}
+			}
+		}
+
 		for (const relation of relations) {
 			const oneField = relation.meta?.one_field;
 			if (!oneField || !(oneField in newItem)) continue;
@@ -276,11 +343,18 @@ export function useItem<T extends Item>(
 						if (existingItem) {
 							clearPrimaryKey(primaryKeyField.value, existingItem);
 							clearJunctionRelatedKey(relation, existsJunctionRelated, existingItem);
+							scrubNestedRelationalIds(relation.collection, existingItem);
 							relatedItem = existingItem;
+						} else if (isObject(relatedItem)) {
+							scrubNestedRelationalIds(relation.collection, relatedItem as Item);
 						}
 
 						return relatedItem;
 					});
+				} else {
+					for (const relatedItem of newItem[oneField]) {
+						if (isObject(relatedItem)) scrubNestedRelationalIds(relation.collection, relatedItem as Item);
+					}
 				}
 			} else if (isObject(newItem[oneField])) {
 				const newRelatedItem = newItem[oneField] as Alterations;
@@ -309,12 +383,14 @@ export function useItem<T extends Item>(
 
 					clearPrimaryKey(relatedPrimaryKeyField, data);
 					clearJunctionRelatedKey(relation, existsJunctionRelated, data);
+					scrubNestedRelationalIds(relation.collection, data);
 
 					newRelatedItem.create.push(data);
 				}
 
 				for (const item of existingItems) {
 					clearPrimaryKey(relatedPrimaryKeyField, item);
+					scrubNestedRelationalIds(relation.collection, item);
 
 					newRelatedItem.create.push(item);
 				}
@@ -322,6 +398,8 @@ export function useItem<T extends Item>(
 				newRelatedItem.update.length = 0;
 			}
 		}
+
+		scrubNestedRelationalIds(collection.value, newItem);
 
 		const errors = validateItem(newItem, fieldsWithPermissions.value, isNew.value);
 		if (nestedValidationErrors.value?.length) errors.push(...nestedValidationErrors.value);

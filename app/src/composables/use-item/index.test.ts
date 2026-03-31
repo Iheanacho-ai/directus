@@ -216,6 +216,126 @@ describe('Save As Copy', () => {
 
 		expect(sdkSpy.mock.lastCall?.[0]()).toEqual(expect.objectContaining({ body: {} }));
 	});
+
+	test('should omit nested m2m junction ids inside translations', async () => {
+		const sdkSpy = vi.spyOn(sdk, 'request');
+
+		const mockCollectionWithDupFields = {
+			collection: 'test',
+			meta: {
+				item_duplication_fields: ['translations.*', 'translations.tags.*', 'translations.tags.tag.*'],
+			},
+		} as unknown as AppCollection;
+
+		const mockPrimaryKeyField = {
+			field: 'id',
+			schema: { has_auto_increment: true },
+		} as Field;
+
+		vi.mocked(useCollection).mockReturnValue({
+			info: computed(() => mockCollectionWithDupFields),
+			primaryKeyField: computed(() => mockPrimaryKeyField),
+			fields: computed(() => [mockPrimaryKeyField]),
+		} as any);
+
+		const fieldsStore = useFieldsStore();
+		const relationsStore = useRelationsStore();
+
+		// Primary keys: all auto-increment so they should be removed during duplication
+		vi.mocked(fieldsStore.getPrimaryKeyFieldForCollection).mockImplementation((collection) => {
+			if (collection === 'test') return mockPrimaryKeyField;
+			if (collection === 'test_translations') return { field: 'id', schema: { has_auto_increment: true } } as Field;
+			if (collection === 'test_translations_tags')
+				return { field: 'id', schema: { has_auto_increment: true } } as Field;
+			if (collection === 'tags') return { field: 'id', schema: { has_auto_increment: true } } as Field;
+			return { field: 'id', schema: { has_auto_increment: true } } as Field;
+		});
+
+		vi.mocked(relationsStore.getRelationsForCollection).mockImplementation((collection) => {
+			if (collection === 'test') {
+				return [
+					{
+						collection: 'test_translations',
+						field: 'test_id',
+						related_collection: 'test',
+						meta: {
+							one_field: 'translations',
+							junction_field: null,
+						},
+					} as unknown as Relation,
+				];
+			}
+
+			if (collection === 'test_translations') {
+				// M2M: translations.tags -> junction collection test_translations_tags, with junction_field "tag"
+				return [
+					{
+						collection: 'test_translations_tags',
+						field: 'translation_id',
+						related_collection: 'test_translations',
+						meta: {
+							one_field: 'tags',
+							junction_field: 'tag',
+						},
+					} as unknown as Relation,
+				];
+			}
+
+			return [];
+		});
+
+		// This is used by clearJunctionRelatedKey to find the relation that describes the junction's related item.
+		vi.mocked(relationsStore).relations = [
+			{
+				collection: 'test_translations_tags',
+				field: 'tag',
+				related_collection: 'tags',
+				meta: {
+					many_field: 'tag',
+				},
+			} as unknown as Relation,
+		] as any;
+
+		// Sequence:
+		// 1) initial getItem (triggered by useItem() setup)
+		// 2) graphql fetch for saveAsCopy
+		// 3) POST /items/test with the new payload
+		sdkSpy
+			.mockResolvedValueOnce({ id: 1 })
+			.mockResolvedValueOnce({
+				item: {
+					id: 1,
+					translations: [
+						{
+							id: 100,
+							tags: [
+								{
+									id: 500, // junction row id -> must be removed
+									tag: { id: 9, name: 'Tag 9' }, // related id can be removed too, but must not break
+								},
+							],
+						},
+					],
+				},
+			})
+			.mockResolvedValueOnce({ id: 2 });
+
+		const { saveAsCopy } = useItem(ref('test'), ref(1));
+		await saveAsCopy();
+
+		const postCall = sdkSpy.mock.lastCall?.[0]();
+
+		expect(postCall).toEqual(
+			expect.objectContaining({
+				path: '/items/test',
+				method: 'POST',
+			}),
+		);
+
+		const body = (postCall as any).body;
+		expect(body).toHaveProperty('translations');
+		expect(body.translations[0].tags[0]).not.toHaveProperty('id');
+	});
 });
 
 describe('Query merging', () => {
